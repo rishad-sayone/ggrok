@@ -7,20 +7,34 @@ import socket
 import struct
 import ssl
 import logging
-import gevent
 import uuid
 
+import gevent
+from gevent import queue, pool
 
-class BaseConnection(object):
 
-    def __init__(self, client_id='', hostname='96.126.125.171', port=443):
-        self.client_id = client_id
-        self.hostname = hostname
-        self.port = port
+class SocketWrapper(object):
 
-        self.logger = logging.getLogger(repr(self))
+    def __init__(self, socket):
+        self.socket = socket
+        self.logger = logging.getLogger(self.__module__)
 
-    def _recv_one(self):
+    @classmethod
+    def connect(cls, hostname, port):
+        try:
+            hostname = socket.gethostbyname(hostname)
+        except socket.gaierror:
+            raise ConnectionError('%r not found' % hostname)
+
+        bare_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        ssl_sock = ssl.wrap_socket(bare_sock, ssl_version=ssl.PROTOCOL_SSLv3)
+        ssl_sock.connect((hostname, port))
+
+        sock = cls(ssl_sock)
+        sock.logger.debug("New connection to %s:%d" % (hostname, port))
+        return sock
+
+    def recv(self):
         length = ''
         while len(length) < 8:
             length += self.socket.recv(8-len(length))
@@ -36,60 +50,33 @@ class BaseConnection(object):
 
         return json.loads(payload)
 
-    def _send(self, msg, payload):
+    def send(self, msg, payload):
         buffer = json.dumps({"Type": msg, "Payload": payload})
         self.logger.debug("Writing message: %s" % buffer)
         self.socket.send(struct.pack('L', len(buffer)))
         self.socket.send(buffer)
 
-    def connect(self):
-        try:
-            hostname = socket.gethostbyname(self.hostname)
-        except socket.gaierror:
-            raise ConnectionError('%r not found' % self.hostname)
 
-        _socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.socket = gevent.ssl.SSLSocket(_socket, ssl_version=ssl.PROTOCOL_SSLv3)
-        self.socket.connect((hostname, self.port))
+class Control(object):
 
-        self.logger.debug("New connection to: %s:%d" % (self.hostname, self.port))
+    def __init__(self, client_id='', hostname='96.126.125.171', port=443):
+        self.client_id = client_id
+        self.hostname = hostname
+        self.port = port
 
-
-class Proxy(BaseConnection):
-
-    def __init__(self, handler, **kwargs):
-        super(Proxy, self).__init__(**kwargs)
-        self.handler = handler
-
-    def wait_for_start(self):
-        self.connect()
-
-        self._send("RegProxy", {
-            "ClientId": self.client_id,
-        })
-
-        self.logger.debug("Waiting for proxy to be started")
-
-        reply = self._recv_one()
-        if reply["Type"] != "StartProxy":
-            raise ConnectionError("Expected 'StartProxy' but got '%s'" % reply["Type"])
-
-        self.logger.debug("Invoking handler for %r (client=%r)" % (reply["Payload"]["Url"], reply["Payload"]["ClientAddr"]))
-
-        self.handler(self.socket, reply["Payload"]["Url"], reply["Payload"]["ClientAddr"])
-
-
-class Control(BaseConnection):
-
-    def __init__(self, **kwargs):
-        super(Control, self).__init__(**kwargs)
+        self.socket = None
         self._tunnels = {}
         self._handlers = {}
 
-    def connect(self, user='', password=''):
-        super(Control, self).connect()
+        self._group = pool.Group()
+        self._outbox = queue.Queue()
 
-        self._send("Auth", {
+        self.logger = logging.getLogger(self.__module__)
+
+    def connect(self, user='', password=''):
+        self.socket = SocketWrapper.connect(self.hostname, self.port)
+
+        self.socket.send("Auth", {
             "Version": "2",
             "MmVersion": "1.7",
             "User": user,
@@ -99,7 +86,7 @@ class Control(BaseConnection):
             "ClientId": self.client_id,
         })
 
-        reply = self._recv_one()
+        reply = self.socket.recv()
         if reply["Type"] != "AuthResp":
             raise ConnectionError("Expected 'AuthResp' but got '%s'" % reply["Type"])
 
@@ -108,18 +95,19 @@ class Control(BaseConnection):
 
         self.client_id = reply["Payload"]["ClientId"]
 
-        gevent.spawn(self._ping_loop)
+        self._group.spawn(self._inbox_loop)
+        self._group.spawn(self._outbox_loop)
+        self._group.spawn(self._ping_loop)
 
-    def _ping_loop(self):
-        while True:
-            gevent.sleep(10)
-            self._send("Ping", {})
+    def send(self, msg_type, payload=None):
+        self.logger.debug("Queued message type %s: %s" % (msg_type, payload))
+        self._outbox.put((msg_type, payload or {}))
 
     def add_tunnel(self, protocol, handler):
         reqid = str(uuid.uuid4()).replace("-", "")[:16]
         self._handlers[reqid] = handler
 
-        self._send("ReqTunnel", {
+        self.send("ReqTunnel", {
             "Protocol": protocol,
             "ReqId": reqid,
             "Hostname": "",
@@ -128,26 +116,59 @@ class Control(BaseConnection):
             "RemotePort": 0,
         })
 
-    def _loop(self):
+    def _outbox_loop(self):
+        while True:
+            self.logger.debug("Waiting for outbox...")
+            msg_type, payload = self._outbox.get()
+            self.socket.send(msg_type, payload)
+
+    def _ping_loop(self):
+        while True:
+            self.logger.debug("Ping loop sleeping...")
+            gevent.sleep(15)
+            self.send("Ping")
+
+    def _inbox_loop(self):
         while True:
             self.logger.debug("Waiting to read message")
-            msg = self._recv_one()
+            msg = self.socket.recv()
             handler = getattr(self, "on_" + msg["Type"].lower(), None)
             if handler:
                 handler(msg['Payload'])
 
     def on_ping(self, payload):
-        self._send("Pong")
+        self.send("Pong")
 
     def on_reqproxy(self, payload):
         # The server will send a ReqProxy message when it wants the client to open up a new Proxy type connection
-        p = Proxy(
-            client_id=self.client_id,
-            hostname=self.hostname,
-            port=self.port,
-            handler=self.on_startproxy,
-        )
-        gevent.spawn(p.wait_for_start)
+        self.logger.debug("Setting up new proxy connection")
+        self._group.spawn(self.setup_proxy_connection)
+
+    def setup_proxy_connection(self):
+        socket = SocketWrapper.connect(self.hostname, self.port)
+        socket.send("RegProxy", {
+            "ClientId": self.client_id,
+        })
+
+        self.logger.debug("Waiting for proxy to be started")
+
+        reply = socket.recv()
+        if reply["Type"] != "StartProxy":
+            raise ConnectionError("Expected 'StartProxy' but got '%s'" % reply["Type"])
+
+        url = reply["Payload"]["Url"]
+        client_addr = reply["Payload"]["ClientAddr"]
+
+        try:
+            handler = self._tunnels[url]
+        except KeyError:
+            self.logger.error("Couldn't find a handler for %r" % url)
+            socket.socket.close()
+            return
+
+        self.logger.debug("Invoking handler for %r (client=%r)" % (url, client_addr))
+
+        handler(socket.socket, client_addr)
 
     def on_newtunnel(self, payload):
         # The server will send a NewTunnel message when it has finished settin up a new end point for us
@@ -162,17 +183,10 @@ class Control(BaseConnection):
             return
 
         self._tunnels[payload['Url']] = self._handlers[payload['ReqId']] 
+        self.logger.debug("Attached handler to '%s'" % payload['Url'])
 
-    def on_startproxy(self, socket, url, client_address):
-        # This is called by a Proxy when it has been told to service a request.
-        try:
-            handler = self._tunnels[url]
-        except KeyError:
-            self.logger.error("Couldn't find a handler for %r" % url)
-            socket.close()
-            return
-
-        handler(socket, client_address)
+    def join(self):
+        return self._group.join()
 
 
 def handler(socket, client_address):
@@ -191,4 +205,4 @@ logging.basicConfig(level=logging.DEBUG)
 c = Control()
 c.connect()
 c.add_tunnel("http+https", handler)
-c._loop()
+c.join()
