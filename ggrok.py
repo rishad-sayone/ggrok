@@ -1,16 +1,15 @@
-
-from gevent.monkey import patch_all
-patch_all()
-
+import gevent
 import json
+import logging
 import socket
 import struct
 import ssl
-import logging
 import uuid
 
-import gevent
 from gevent import queue, pool
+from gevent.monkey import patch_all
+
+patch_all()
 
 
 class SocketWrapper(object):
@@ -132,7 +131,7 @@ class Control(object):
         while True:
             self.logger.debug("Waiting to read message")
             msg = self.socket.recv()
-            handler = getattr(self, "on_" + msg["Type"].lower(), None)
+            handler = getattr(self, "on_%s" % msg["Type"].lower(), None)
             if handler:
                 handler(msg['Payload'])
 
